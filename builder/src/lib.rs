@@ -31,6 +31,7 @@ fn generate_builder(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
     Ok(ret)
 }
 
+// 生成 builder struct 及对应的方法
 fn generate_builder_struct(input: &DeriveInput) -> Result<proc_macro2::TokenStream> {
     // builder struct 名称
     let builder_ident = get_builder_struct_ident(input);
@@ -55,26 +56,30 @@ fn generate_builder_struct(input: &DeriveInput) -> Result<proc_macro2::TokenStre
     }
 
     let setter_fns = generate_setter_fn(&fields_ident, &fields_ty)?;
+    let builder_fn = validate_all_field(input, &fields_ident)?;
 
     let ret = quote! {
         pub struct #builder_ident {
-            #(#fields_ident: core::option::Option<#fields_ty>),*
+            #(#fields_ident: std::option::Option<#fields_ty>),*
         }
 
         impl #builder_ident {
             pub fn new() -> #builder_ident {
                 #builder_ident {
-                    #(#fields_ident: core::option::Option::None),*
+                    #(#fields_ident: std::option::Option::None),*
                 }
             }
 
             #(#setter_fns)*
+
+            #builder_fn
         }
     };
 
     Ok(ret)
 }
 
+// 生成 setter 方法
 fn generate_setter_fn<'a>(
     fields_ident: &'a [&Ident],
     fields_ty: &'a [&Type],
@@ -83,7 +88,7 @@ fn generate_setter_fn<'a>(
     for (ident, ty) in fields_ident.iter().zip(fields_ty) {
         let setter_fn = quote! {
             pub fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                self.#ident = core::option::Option::Some(#ident);
+                self.#ident = std::option::Option::Some(#ident);
                 self
             }
         };
@@ -94,6 +99,40 @@ fn generate_setter_fn<'a>(
     Ok(setter_fns)
 }
 
+// 检测是否所有的字赋值
+fn validate_all_field(
+    input: &DeriveInput,
+    fields_ident: &[&Ident],
+) -> Result<proc_macro2::TokenStream> {
+    let struct_ident = &input.ident;
+
+    let mut validations = Vec::new();
+
+    for ident in fields_ident.iter() {
+        let ident_error_msg = format!("{} show be set", ident);
+        validations.push(quote! {
+            if self.#ident.is_none() {
+                return std::result::Result::Err(std::boxed::Box::<dyn std::error::Error>::from(#ident_error_msg));
+            }
+        });
+    }
+
+    let ret = quote! {
+        pub fn build(&mut self) -> Result<#struct_ident, Box<dyn std::error::Error>> {
+            #(#validations)*
+
+            let ret = #struct_ident {
+                #(#fields_ident: self.#fields_ident.clone().unwrap()),*
+            };
+
+            std::result::Result::Ok(ret)
+        }
+    };
+
+    Ok(ret)
+}
+
+// 获取 builder 的名称
 fn get_builder_struct_ident(input: &DeriveInput) -> Ident {
     let struct_name = input.ident.to_string();
     let builder_struct = format!("{}Builder", struct_name);
