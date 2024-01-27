@@ -240,10 +240,10 @@ fn validate_all_field(
 
         if field.vec_ident.is_none() {
             validations.push(quote! {
-            if !#is_optional && self.#builder_field_ident.is_none() {
-                return std::result::Result::Err(std::boxed::Box::<dyn std::error::Error>::from(#ident_error_msg));
-            }
-        });
+                if !#is_optional && self.#builder_field_ident.is_none() {
+                    return std::result::Result::Err(std::boxed::Box::<dyn std::error::Error>::from(#ident_error_msg));
+                }
+            });
         }
 
         let struct_field_ret = if is_optional || field.vec_ident.is_some() {
@@ -325,6 +325,11 @@ fn check_vec_type(field: &syn::Field) -> syn::Result<Option<(String, &Type)>> {
                                     }
                                 }
                             }
+                        } else {
+                            return Err(syn::Error::new_spanned(
+                                &attr.meta,
+                                r#"expected `builder(each = "...")`"#,
+                            ));
                         }
                     }
                     _ => (),
