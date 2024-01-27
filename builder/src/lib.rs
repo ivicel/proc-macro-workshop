@@ -256,7 +256,7 @@ fn validate_all_field(
     }
 
     let ret = quote! {
-        pub fn build(&mut self) -> Result<#struct_ident, Box<dyn std::error::Error>> {
+        pub fn build(&mut self) -> std::result::Result<#struct_ident, std::boxed::Box<dyn std::error::Error>> {
             #(#validations)*
 
             let ret = #struct_ident {
