@@ -1,11 +1,11 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    parse_macro_input, spanned::Spanned, AngleBracketedGenericArguments, DeriveInput,
-    GenericArgument, Ident, Path, PathArguments, Result, Type, TypePath,
+    parse_macro_input, spanned::Spanned, AngleBracketedGenericArguments, DeriveInput, Expr,
+    GenericArgument, Ident, Lit, PathArguments, Result, Type, TypePath,
 };
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
@@ -17,12 +17,25 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
 // struct 字段说明
 struct InnerBuilderField<'a> {
-    // 字段类型
-    ty: &'a syn::Type,
-    // 字段名
-    ident: &'a syn::Ident,
-    // 是否为 option
-    is_optional: bool,
+    /// 字段类型
+    ty: &'a Type,
+    /// 字段名
+    ident: &'a Ident,
+    /// 是否为 option
+    optional: bool,
+    /// 字段 vec 的自定义名称和里面类型
+    vec_ident: Option<(String, &'a Type)>,
+}
+
+impl<'a> InnerBuilderField<'a> {
+    pub fn new(ty: &'a Type, ident: &'a Ident, optional: bool) -> Self {
+        Self {
+            ty,
+            ident,
+            optional,
+            vec_ident: None,
+        }
+    }
 }
 
 // 生成自定义的 builder
@@ -59,8 +72,8 @@ fn generate_builder_token(input: &DeriveInput) -> Result<proc_macro2::TokenStrea
         _ => return Err(syn::Error::new(input.span(), "Only use on struct")),
     };
 
-    // struct 原始字段, builder struct 字段
-    let (_fields_ident, builder_fields) = fill_builder_field(fields);
+    //  builder struct 字段
+    let builder_fields = fill_builder_field(fields)?;
 
     let builder_struct = generate_builder_struct(&builder_ident, &builder_fields)?;
     let builder_struct_new_fn = generate_builder_struct_new_fn(&builder_ident, &builder_fields)?;
@@ -85,7 +98,7 @@ fn generate_builder_token(input: &DeriveInput) -> Result<proc_macro2::TokenStrea
 
 /// builder struct 的 new 方法
 fn generate_builder_struct_new_fn(
-    builder_ident: &syn::Ident,
+    builder_ident: &Ident,
     builder_fields: &[InnerBuilderField],
 ) -> Result<proc_macro2::TokenStream> {
     let fields = builder_fields
@@ -93,16 +106,25 @@ fn generate_builder_struct_new_fn(
         .map(|field| {
             let ident = field.ident;
 
-            return quote! {
-                #ident
-            };
+            match field.vec_ident {
+                Some(_) => {
+                    quote! {
+                        #ident: std::vec::Vec::new()
+                    }
+                }
+                None => {
+                    quote! {
+                        #ident: std::option::Option::None
+                    }
+                }
+            }
         })
         .collect::<Vec<_>>();
 
     Ok(quote! {
         pub fn new() -> #builder_ident {
                 #builder_ident {
-                    #(#fields: std::option::Option::None),*
+                    #(#fields),*
                 }
             }
     })
@@ -110,7 +132,7 @@ fn generate_builder_struct_new_fn(
 
 /// 生成 builder struct 的 token stream
 fn generate_builder_struct(
-    builder_ident: &syn::Ident,
+    builder_ident: &Ident,
     builder_fields: &[InnerBuilderField],
 ) -> Result<proc_macro2::TokenStream> {
     let fields = builder_fields
@@ -119,9 +141,18 @@ fn generate_builder_struct(
             let ident = field.ident;
             let ty = field.ty;
 
-            return quote! {
-                #ident: std::option::Option<#ty>
-            };
+            match field.vec_ident {
+                Some((_, ref vec_inner_type)) => {
+                    quote! {
+                        #ident: std::vec::Vec<#vec_inner_type>
+                    }
+                }
+                None => {
+                    quote! {
+                            #ident: std::option::Option<#ty>
+                    }
+                }
+            }
         })
         .collect::<Vec<_>>();
 
@@ -133,9 +164,7 @@ fn generate_builder_struct(
 }
 
 /// 填充 builder struct 字段
-fn fill_builder_field<'a>(
-    fields: &'a syn::FieldsNamed,
-) -> (Vec<&'a Ident>, Vec<InnerBuilderField<'a>>) {
+fn fill_builder_field<'a>(fields: &'a syn::FieldsNamed) -> syn::Result<Vec<InnerBuilderField<'a>>> {
     let mut fields_ident = Vec::new();
     let mut builder_fields = Vec::new();
 
@@ -144,24 +173,18 @@ fn fill_builder_field<'a>(
         let type_ref = &field.ty;
         fields_ident.push(ident);
 
-        // 如果字段为 option 类型, 那泛型
-        let builder_field = match get_optional_type(&field.ty) {
-            Some(inner_type) => InnerBuilderField {
-                ty: inner_type,
-                ident,
-                is_optional: true,
-            },
-            None => InnerBuilderField {
-                ty: type_ref,
-                ident,
-                is_optional: false,
-            },
+        // 如果字段为 option 类型, 那取里面的泛型
+        let mut builder_field = match check_optional_type(&field.ty) {
+            Some(inner_type) => InnerBuilderField::new(inner_type, ident, true),
+            None => InnerBuilderField::new(type_ref, ident, false),
         };
 
+        // 查看字段是否为 vec 类型和有 builder 注解
+        builder_field.vec_ident = check_vec_type(field)?;
         builder_fields.push(builder_field);
     }
 
-    (fields_ident, builder_fields)
+    Ok(builder_fields)
 }
 
 // 生成 builder struct 的 setter 方法
@@ -173,10 +196,25 @@ fn generate_builder_setter_fn(
         let ident = field.ident;
         let ty = field.ty;
 
-        let setter_fn = quote! {
-            pub fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                self.#ident = std::option::Option::Some(#ident);
-                self
+        // 如果字段为 vec 并且有 builder 注释
+        let setter_fn = match field.vec_ident {
+            Some((ref each_name, vec_inner_type)) => {
+                let vec_each_ident = Ident::new(&each_name, ident.span());
+
+                quote! {
+                    pub fn #vec_each_ident(&mut self, #vec_each_ident: #vec_inner_type) -> &mut Self {
+                        self.#ident.push(#vec_each_ident);
+                        self
+                    }
+                }
+            }
+            None => {
+                quote! {
+                    pub fn #ident(&mut self, #ident: #ty) -> &mut Self {
+                        self.#ident = std::option::Option::Some(#ident);
+                        self
+                    }
+                }
             }
         };
 
@@ -186,7 +224,7 @@ fn generate_builder_setter_fn(
     Ok(setter_fns)
 }
 
-// 检测 builder struct 里需要赋值字段是赋值
+/// 检测 builder struct 里需要赋值字段是已经被赋值了
 fn validate_all_field(
     struct_ident: &Ident,
     inner_fields: &[InnerBuilderField],
@@ -196,16 +234,19 @@ fn validate_all_field(
 
     for field in inner_fields.iter() {
         let builder_field_ident = field.ident;
-        let is_optional = field.is_optional;
+        let is_optional = field.optional;
 
         let ident_error_msg = format!("{} show be set", builder_field_ident);
-        validations.push(quote! {
+
+        if field.vec_ident.is_none() {
+            validations.push(quote! {
             if !#is_optional && self.#builder_field_ident.is_none() {
                 return std::result::Result::Err(std::boxed::Box::<dyn std::error::Error>::from(#ident_error_msg));
             }
         });
+        }
 
-        let struct_field_ret = if is_optional {
+        let struct_field_ret = if is_optional || field.vec_ident.is_some() {
             quote! { #builder_field_ident: self.#builder_field_ident.clone(),}
         } else {
             quote! { #builder_field_ident: self.#builder_field_ident.clone().unwrap(),}
@@ -228,7 +269,7 @@ fn validate_all_field(
     Ok(ret)
 }
 
-// 获取 builder 的名称
+/// 获取 builder 的名称
 fn get_builder_struct_ident(input: &DeriveInput) -> Ident {
     let struct_name = input.ident.to_string();
     let builder_struct = format!("{}Builder", struct_name);
@@ -236,15 +277,11 @@ fn get_builder_struct_ident(input: &DeriveInput) -> Ident {
 }
 
 /// 查看当前字段是否为 Option 字段,
-fn get_optional_type(ty: &syn::Type) -> Option<&syn::Type> {
+fn check_optional_type(ty: &Type) -> Option<&Type> {
     let mut ret = None;
 
-    if let Type::Path(TypePath {
-        path: Path { segments, .. },
-        ..
-    }) = ty
-    {
-        if let Some(s) = segments.last() {
+    if let Type::Path(TypePath { path, .. }) = ty {
+        if let Some(s) = path.segments.last() {
             if s.ident.to_string() == "Option" {
                 if let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
                     ref args,
@@ -260,4 +297,46 @@ fn get_optional_type(ty: &syn::Type) -> Option<&syn::Type> {
     }
 
     ret
+}
+
+/// 查看当前字段是否为 vec 类型
+fn check_vec_type(field: &syn::Field) -> syn::Result<Option<(String, &Type)>> {
+    for attr in field.attrs.iter() {
+        if attr.path().is_ident("builder") {
+            if let Type::Path(TypePath { ref path, .. }) = field.ty {
+                // 如果字段为 Vec 类型
+                match path.segments.last() {
+                    Some(s) if s.ident.to_string() == "Vec" => {
+                        // 查看是否有 builder attribute
+                        let kv = attr.parse_args::<syn::MetaNameValue>()?;
+                        if kv.path.is_ident("each") {
+                            if let Expr::Lit(syn::ExprLit {
+                                lit: Lit::Str(ref lit_str),
+                                ..
+                            }) = kv.value
+                            {
+                                // 取出 vec 类型
+                                if let PathArguments::AngleBracketed(
+                                    AngleBracketedGenericArguments { ref args, .. },
+                                ) = s.arguments
+                                {
+                                    if let Some(GenericArgument::Type(vec_type)) = args.first() {
+                                        return Ok(Some((lit_str.value(), vec_type)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+            }
+
+            return Err(syn::Error::new(
+                field.span(),
+                "builder attribute only for vec type",
+            ));
+        }
+    }
+
+    Ok(None)
 }
